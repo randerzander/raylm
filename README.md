@@ -1,11 +1,17 @@
 # raylm
 
-Distributed PDF parsing and embedding pipeline using Ray, NVIDIA NeMo, and LanceDB.
+Distributed PDF and text file parsing and embedding pipeline using Ray, NVIDIA NeMo, and LanceDB.
 
 ## Overview
 
-5-stage pipeline for PDF processing:
+Multi-stage pipeline for PDF and text file processing:
 
+**Text Files:**
+1. **Chunk** - Split on ~4096 token boundaries
+2. **Embed** - Generate vectors via NVIDIA NeMo Retriever
+3. **Store** - Save to LanceDB
+
+**PDFs:**
 1. **Split** - PDFs into individual pages
 2. **Render** - Pages to JPEG images
 3. **Parse** - Images to markdown via NVIDIA NeMo Parse
@@ -17,10 +23,11 @@ All stages run in parallel using Ray.
 ## Features
 
 - Parallel processing with Ray actors
+- Text file chunking (~4096 token boundaries)
 - Bulk vector storage with LanceDB
-- Per-PDF output organization
+- Per-file output organization
 - RAG query interface with Nemotron LLM
-- Throughput metrics (pages/sec)
+- Throughput metrics (items/sec)
 
 ## Requirements
 
@@ -32,13 +39,13 @@ All stages run in parallel using Ray.
 Using uv:
 
 ```bash
-uv add ray pypdfium2 requests openai lancedb pillow
+uv add ray pypdfium2 requests openai lancedb pillow sentencepiece
 ```
 
 Or pip:
 
 ```bash
-pip install ray pypdfium2 requests openai lancedb pillow
+pip install ray pypdfium2 requests openai lancedb pillow sentencepiece
 ```
 
 ## Setup
@@ -49,9 +56,9 @@ export NVIDIA_API_KEY="your_api_key_here"
 
 ## Usage
 
-### Process PDFs
+### Process Files
 
-Place PDFs in `data/` directory:
+Place PDFs and/or text files in `data/` directory:
 
 ```bash
 python ray_pdf_parser.py
@@ -72,11 +79,16 @@ python query.py
 ## Output Structure
 
 ```
-extracts/<pdf_name>/
+extracts/<file_name>/
+# For PDFs:
 ├── pages_jpg/         # JPEG images
 ├── pages_json/        # API responses
 ├── pages_md/          # Markdown text
 └── pages_embeddings/  # Embedding vectors
+
+# For text files:
+├── text_chunks/       # Text chunks
+└── text_embeddings/   # Embedding vectors
 
 lancedb/               # Vector database
 scratch/               # Intermediate PDFs
@@ -86,9 +98,9 @@ scratch/               # Intermediate PDFs
 
 Table: `document_embeddings`
 
-- **source_id** (string) - PDF filename
-- **chunk_sequence** (int) - Page number
-- **text** (string) - Markdown content
+- **source_id** (string) - PDF or text filename
+- **chunk_sequence** (int) - Page/chunk number
+- **text** (string) - Markdown or text content
 - **vector** (list[float]) - 4096-dim embedding
 
 ## Query Script
@@ -103,9 +115,10 @@ Output includes reasoning, answer, and source citations.
 
 ## Performance
 
-- **Parsing**: ~5s per page
-- **Embeddings**: ~1s per page
-- **Throughput**: ~0.5 pages/sec end-to-end
+- **Text chunking**: Fast, character-based (~4 chars/token)
+- **Embeddings**: ~1s per chunk/page
+- **PDF parsing**: ~5s per page
+- **Throughput**: ~0.5 items/sec end-to-end
 
 Ray's parallel processing makes end-to-end time much faster than sequential processing.
 
