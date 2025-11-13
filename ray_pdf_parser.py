@@ -7,6 +7,8 @@ import requests
 import ray
 import pypdfium2 as pdfium
 from pathlib import Path
+from openai import OpenAI
+import lancedb
 import time
 
 
@@ -110,6 +112,128 @@ class PDFRendererActor:
 
 
 @ray.remote
+class EmbeddingGeneratorActor:
+    """Ray actor to generate embeddings for markdown pages using NVIDIA API."""
+    
+    def __init__(self):
+        self.api_key = os.getenv("NVIDIA_API_KEY")
+        if not self.api_key:
+            raise ValueError("NVIDIA_API_KEY environment variable not set")
+        
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://integrate.api.nvidia.com/v1"
+        )
+    
+    def generate_embedding(self, md_path, output_dir, pdf_name):
+        """Generate embeddings for a markdown file and save results."""
+        md_path = Path(md_path)
+        output_dir = Path(output_dir)
+        
+        # Create output directory for embeddings
+        embedding_output_dir = output_dir / pdf_name / "pages_embeddings"
+        embedding_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Read markdown content
+        with open(md_path, "r", encoding="utf-8") as f:
+            text_content = f.read()
+        
+        if not text_content.strip():
+            print(f"Warning: Empty markdown file {md_path.name}")
+            return {
+                "md_file": str(md_path),
+                "embedding_file": None,
+                "embedding_time": 0
+            }
+        
+        # Generate embedding
+        start_time = time.time()
+        try:
+            response = self.client.embeddings.create(
+                input=[text_content],
+                model="nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",
+                encoding_format="float",
+                extra_body={"modality": ["text"], "input_type": "query", "truncate": "NONE"}
+            )
+            embedding = response.data[0].embedding
+            embedding_time = time.time() - start_time
+            
+            # Save embedding
+            embedding_file = embedding_output_dir / f"{md_path.stem}.json"
+            with open(embedding_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "embedding": embedding,
+                    "model": "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",
+                    "text": text_content
+                }, f, ensure_ascii=False, indent=2)
+            
+            return {
+                "md_file": str(md_path),
+                "embedding_file": str(embedding_file),
+                "embedding_time": embedding_time
+            }
+        except Exception as e:
+            print(f"Error generating embedding for {md_path.name}: {e}")
+            return {
+                "md_file": str(md_path),
+                "embedding_file": None,
+                "embedding_time": time.time() - start_time
+            }
+
+
+@ray.remote
+def write_to_lancedb(embedding_results, md_tasks, db_path):
+    """Write all embedding data to LanceDB in a single bulk operation."""
+    records = []
+    
+    for embedding_result, (_, pdf_name) in zip(embedding_results, md_tasks):
+        if not embedding_result.get("embedding_file"):
+            continue
+        
+        try:
+            # Load embedding data
+            with open(embedding_result["embedding_file"], "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            # Extract page number from filename (e.g., "page_001.json" -> 1)
+            md_path = Path(embedding_result["md_file"])
+            page_str = md_path.stem.split("_")[-1]
+            page_number = int(page_str)
+            
+            # Prepare record
+            record = {
+                "source_id": pdf_name,
+                "chunk_sequence": page_number,
+                "text": data["text"],
+                "vector": data["embedding"]
+            }
+            records.append(record)
+        except Exception as e:
+            print(f"Error loading embedding data: {e}")
+            continue
+    
+    if not records:
+        return {"success": 0, "failed": 0}
+    
+    try:
+        # Connect and write all records at once
+        db = lancedb.connect(db_path)
+        table_name = "document_embeddings"
+        
+        try:
+            table = db.open_table(table_name)
+            table.add(records)
+        except Exception:
+            # Table doesn't exist, create it
+            table = db.create_table(table_name, data=records)
+        
+        return {"success": len(records), "failed": 0}
+    except Exception as e:
+        print(f"Error writing to LanceDB: {e}")
+        return {"success": 0, "failed": len(records)}
+
+
+@ray.remote
 class ModelParserActor:
     """Ray actor to parse a JPEG image using NVIDIA API."""
     
@@ -189,11 +313,12 @@ class ModelParserActor:
         }
 
 
-def process_pdfs(data_dir="data", scratch_dir="scratch", output_dir="extracts"):
+def process_pdfs(data_dir="data", scratch_dir="scratch", output_dir="extracts", db_path="lancedb"):
     """Process all PDFs using Ray actors: split then render to JPEGs."""
     data_dir = Path(data_dir)
     scratch_dir = Path(scratch_dir)
     output_dir = Path(output_dir)
+    db_path = Path(db_path)
     
     scratch_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +335,9 @@ def process_pdfs(data_dir="data", scratch_dir="scratch", output_dir="extracts"):
     # Initialize Ray
     ray.init(ignore_reinit_error=True)
     
+    # Start timing
+    pipeline_start = time.time()
+    
     try:
         # Stage 1: Split PDFs into single-page PDFs
         print("=== Stage 1: Splitting PDFs ===")
@@ -224,8 +352,10 @@ def process_pdfs(data_dir="data", scratch_dir="scratch", output_dir="extracts"):
         
         # Collect all page files with their PDF names
         all_tasks = []
+        total_pages = 0
         for result in split_results:
             pdf_name = Path(result["pdf_name"]).stem
+            total_pages += result["num_pages"]
             for page_file in result["page_files"]:
                 all_tasks.append((page_file, pdf_name))
         
@@ -260,21 +390,70 @@ def process_pdfs(data_dir="data", scratch_dir="scratch", output_dir="extracts"):
         
         print(f"Parsed {len(parse_results)} images\n")
         
+        # Stage 4: Generate embeddings for each markdown file
+        print("=== Stage 4: Generating embeddings ===")
+        
+        # Collect all markdown files with their PDF names
+        md_tasks = []
+        for result, (_, pdf_name) in zip(parse_results, all_tasks):
+            if result.get("md_file"):
+                md_tasks.append((result["md_file"], pdf_name))
+        
+        if md_tasks:
+            embedding_actors = [EmbeddingGeneratorActor.remote() for _ in md_tasks]
+            
+            embedding_futures = [
+                actor.generate_embedding.remote(md_file, str(output_dir), pdf_name)
+                for actor, (md_file, pdf_name) in zip(embedding_actors, md_tasks)
+            ]
+            
+            embedding_results = ray.get(embedding_futures)
+            
+            successful_embeddings = sum(1 for r in embedding_results if r["embedding_file"])
+            total_embedding_time = sum(r["embedding_time"] for r in embedding_results)
+            avg_embedding_time = total_embedding_time / len(embedding_results) if embedding_results else 0
+            
+            print(f"Generated {successful_embeddings}/{len(md_tasks)} embeddings\n")
+        else:
+            embedding_results = []
+            total_embedding_time = 0
+            avg_embedding_time = 0
+            print("No markdown files to process\n")
+        
+        # Stage 5: Write embeddings to LanceDB (single bulk write)
+        print("=== Stage 5: Writing to LanceDB ===")
+        
+        if embedding_results and any(r["embedding_file"] for r in embedding_results):
+            lancedb_future = write_to_lancedb.remote(embedding_results, md_tasks, str(db_path))
+            lancedb_result = ray.get(lancedb_future)
+            
+            print(f"Wrote {lancedb_result['success']} records to LanceDB\n")
+        else:
+            lancedb_result = {"success": 0, "failed": 0}
+            print("No embeddings to write to LanceDB\n")
+        
+        # Calculate end-to-end timing
+        pipeline_end = time.time()
+        total_pipeline_time = pipeline_end - pipeline_start
+        pages_per_second = total_pages / total_pipeline_time if total_pipeline_time > 0 else 0
+        
         # Print summary
         print("=== Summary ===")
-        total_pages = 0
         for result in split_results:
             pdf_name = Path(result["pdf_name"]).stem
             print(f"{result['pdf_name']}: {result['num_pages']} pages")
             print(f"  Output: {output_dir}/{pdf_name}/")
-            total_pages += result['num_pages']
         
         print(f"\nTotal: {len(pdf_files)} PDFs, {total_pages} pages")
         print(f"Page PDFs saved to: {scratch_dir}/")
-        print(f"Extracts saved to: {output_dir}/<pdf_name>/{{pages_jpg,pages_json,pages_md}}/")
-        print(f"\nModel timing:")
-        print(f"  Total: {total_model_time:.2f}s")
-        print(f"  Average per page: {avg_model_time:.2f}s")
+        print(f"Extracts saved to: {output_dir}/<pdf_name>/{{pages_jpg,pages_json,pages_md,pages_embeddings}}/")
+        if lancedb_result["success"] > 0:
+            print(f"LanceDB saved to: {db_path}/ ({lancedb_result['success']} records)")
+        print(f"\nTiming:")
+        print(f"  End-to-End - Total: {total_pipeline_time:.2f}s, Throughput: {pages_per_second:.2f} pages/sec")
+        print(f"  Parsing - Total: {total_model_time:.2f}s, Average: {avg_model_time:.2f}s per page")
+        if embedding_results:
+            print(f"  Embeddings - Total: {total_embedding_time:.2f}s, Average: {avg_embedding_time:.2f}s per page")
         
     finally:
         ray.shutdown()
