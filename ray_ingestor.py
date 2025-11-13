@@ -161,76 +161,122 @@ class TextChunkerActor:
 
 
 @ray.remote
-class EmbeddingGeneratorActor:
-    """Ray actor to generate embeddings using NVIDIA API (for both text chunks and markdown pages)."""
+def generate_embeddings_batch(content_paths_and_names, output_dir, batch_size=32):
+    """Generate embeddings for multiple content files in batches using NVIDIA API.
     
-    def __init__(self):
-        self.api_key = os.getenv("NVIDIA_API_KEY")
-        if not self.api_key:
-            raise ValueError("NVIDIA_API_KEY environment variable not set")
-        
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://integrate.api.nvidia.com/v1"
-        )
+    Args:
+        content_paths_and_names: List of (content_path, source_name) tuples
+        output_dir: Output directory for embeddings
+        batch_size: Number of texts to embed in a single API call
     
-    def generate_embedding(self, content_path, output_dir, source_name):
-        """Generate embeddings for a content file (markdown page or text chunk) and save results."""
-        content_path = Path(content_path)
-        output_dir = Path(output_dir)
+    Returns:
+        dict with 'results' list and 'num_requests' count
+    """
+    api_key = os.getenv("NVIDIA_API_KEY")
+    if not api_key:
+        raise ValueError("NVIDIA_API_KEY environment variable not set")
+    
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://integrate.api.nvidia.com/v1"
+    )
+    
+    output_dir = Path(output_dir)
+    results = []
+    num_requests = 0
+    
+    # Process in batches
+    for batch_start in range(0, len(content_paths_and_names), batch_size):
+        batch = content_paths_and_names[batch_start:batch_start + batch_size]
         
-        # Determine output directory based on content type
-        if "text_chunks" in str(content_path):
-            embedding_output_dir = output_dir / source_name / "text_embeddings"
-        else:
-            embedding_output_dir = output_dir / source_name / "pages_embeddings"
+        # Read all content files in batch
+        batch_texts = []
+        batch_metadata = []
         
-        embedding_output_dir.mkdir(parents=True, exist_ok=True)
+        for content_path, source_name in batch:
+            content_path = Path(content_path)
+            
+            try:
+                with open(content_path, "r", encoding="utf-8") as f:
+                    text_content = f.read()
+                
+                if text_content.strip():
+                    batch_texts.append(text_content)
+                    batch_metadata.append({
+                        "content_path": content_path,
+                        "source_name": source_name,
+                        "text": text_content
+                    })
+                else:
+                    results.append({
+                        "content_file": str(content_path),
+                        "embedding_file": None,
+                        "embedding_time": 0
+                    })
+            except Exception as e:
+                print(f"Error reading {content_path}: {e}")
+                results.append({
+                    "content_file": str(content_path),
+                    "embedding_file": None,
+                    "embedding_time": 0
+                })
         
-        # Read content
-        with open(content_path, "r", encoding="utf-8") as f:
-            text_content = f.read()
+        if not batch_texts:
+            continue
         
-        if not text_content.strip():
-            return {
-                "content_file": str(content_path),
-                "embedding_file": None,
-                "embedding_time": 0
-            }
-        
-        # Generate embedding
+        # Generate embeddings for batch
         start_time = time.time()
         try:
-            response = self.client.embeddings.create(
-                input=[text_content],
+            response = client.embeddings.create(
+                input=batch_texts,
                 model="nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",
                 encoding_format="float",
                 extra_body={"modality": ["text"], "input_type": "query", "truncate": "NONE"}
             )
-            embedding = response.data[0].embedding
+            num_requests += 1  # Count API request
             embedding_time = time.time() - start_time
             
-            # Save embedding
-            embedding_file = embedding_output_dir / f"{content_path.stem}.json"
-            with open(embedding_file, "w", encoding="utf-8") as f:
-                json.dump({
-                    "embedding": embedding,
-                    "model": "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",
-                    "text": text_content
-                }, f, ensure_ascii=False, indent=2)
-            
-            return {
-                "content_file": str(content_path),
-                "embedding_file": str(embedding_file),
-                "embedding_time": embedding_time
-            }
+            # Save each embedding
+            for i, (embedding_data, metadata) in enumerate(zip(response.data, batch_metadata)):
+                content_path = metadata["content_path"]
+                source_name = metadata["source_name"]
+                
+                # Determine output directory based on content type
+                if "text_chunks" in str(content_path):
+                    embedding_output_dir = output_dir / source_name / "text_embeddings"
+                else:
+                    embedding_output_dir = output_dir / source_name / "pages_embeddings"
+                
+                embedding_output_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Save embedding
+                embedding_file = embedding_output_dir / f"{content_path.stem}.json"
+                with open(embedding_file, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "embedding": embedding_data.embedding,
+                        "model": "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",
+                        "text": metadata["text"]
+                    }, f, ensure_ascii=False, indent=2)
+                
+                results.append({
+                    "content_file": str(content_path),
+                    "embedding_file": str(embedding_file),
+                    "embedding_time": embedding_time / len(batch_texts)  # Amortize time across batch
+                })
+        
         except Exception as e:
-            print(f"Error generating embedding for {content_path.name}: {e}")
-            return {
-                "content_file": str(content_path),
-                "embedding_file": None,
-                "embedding_time": time.time() - start_time
-            }
+            print(f"Error generating embeddings for batch: {e}")
+            for metadata in batch_metadata:
+                results.append({
+                    "content_file": str(metadata["content_path"]),
+                    "embedding_file": None,
+                    "embedding_time": 0
+                })
+    
+    return {
+        "results": results,
+        "num_requests": num_requests
+    }
 
 
 @ray.remote
@@ -394,6 +440,10 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
     pdf_files = sorted(data_dir.glob("*.pdf"))
     txt_files = sorted(data_dir.glob("*.txt"))
     
+    # Initialize request counters
+    total_parse_requests = 0
+    total_embedding_requests = 0
+    
     if not pdf_files and not txt_files:
         print(f"No PDF or text files found in {data_dir}")
         return
@@ -433,22 +483,20 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
             
             print(f"Chunked {len(txt_files)} text files into {total_chunks} chunks\n")
             
-            # Stage 1b: Generate embeddings for text chunks
+            # Stage 1b: Generate embeddings for text chunks (batched)
             if text_tasks:
                 print("=== Stage 1b: Embedding text chunks ===")
-                text_embedding_actors = [EmbeddingGeneratorActor.remote() for _ in text_tasks]
                 
-                text_embedding_futures = [
-                    actor.generate_embedding.remote(chunk_file, str(output_dir), text_name)
-                    for actor, (chunk_file, text_name) in zip(text_embedding_actors, text_tasks)
-                ]
-                
-                text_embedding_results = ray.get(text_embedding_futures)
+                # Batch all text tasks into fewer API calls
+                embedding_future = generate_embeddings_batch.remote(text_tasks, str(output_dir), batch_size=32)
+                text_embedding_data = ray.get(embedding_future)
+                text_embedding_results = text_embedding_data["results"]
+                total_embedding_requests += text_embedding_data["num_requests"]
                 
                 successful_text_embeddings = sum(1 for r in text_embedding_results if r["embedding_file"])
                 total_text_embedding_time = sum(r["embedding_time"] for r in text_embedding_results)
                 
-                print(f"Generated {successful_text_embeddings}/{len(text_tasks)} text embeddings\n")
+                print(f"Generated {successful_text_embeddings}/{len(text_tasks)} text embeddings ({text_embedding_data['num_requests']} API requests)\n")
                 
                 all_embedding_results.extend(text_embedding_results)
                 all_source_tasks.extend(text_tasks)
@@ -503,12 +551,13 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
             
             parse_results = ray.get(parse_futures)
             
+            total_parse_requests += len(parse_results)  # Count parsing API requests
             total_model_time = sum(r["model_time"] for r in parse_results)
             avg_model_time = total_model_time / len(parse_results) if parse_results else 0
             
-            print(f"Parsed {len(parse_results)} images\n")
+            print(f"Parsed {len(parse_results)} images ({len(parse_results)} API requests)\n")
             
-            # Stage 5: Generate embeddings for each markdown file
+            # Stage 5: Generate embeddings for markdown files (batched)
             print("=== Stage 5: Generating PDF embeddings ===")
             
             # Collect all markdown files with their PDF names
@@ -518,20 +567,17 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
                     md_tasks.append((result["md_file"], pdf_name))
             
             if md_tasks:
-                embedding_actors = [EmbeddingGeneratorActor.remote() for _ in md_tasks]
-                
-                embedding_futures = [
-                    actor.generate_embedding.remote(md_file, str(output_dir), pdf_name)
-                    for actor, (md_file, pdf_name) in zip(embedding_actors, md_tasks)
-                ]
-                
-                embedding_results = ray.get(embedding_futures)
+                # Batch all markdown tasks into fewer API calls
+                embedding_future = generate_embeddings_batch.remote(md_tasks, str(output_dir), batch_size=32)
+                embedding_data = ray.get(embedding_future)
+                embedding_results = embedding_data["results"]
+                total_embedding_requests += embedding_data["num_requests"]
                 
                 successful_embeddings = sum(1 for r in embedding_results if r["embedding_file"])
                 total_embedding_time = sum(r["embedding_time"] for r in embedding_results)
                 avg_embedding_time = total_embedding_time / len(embedding_results) if embedding_results else 0
                 
-                print(f"Generated {successful_embeddings}/{len(md_tasks)} embeddings\n")
+                print(f"Generated {successful_embeddings}/{len(md_tasks)} embeddings ({embedding_data['num_requests']} API requests)\n")
                 
                 all_embedding_results.extend(embedding_results)
                 all_source_tasks.extend(md_tasks)
@@ -598,6 +644,13 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
             print(f"  PDF Parsing - Total: {total_model_time:.2f}s, Average: {avg_model_time:.2f}s per page")
             if embedding_results and total_embedding_time > 0:
                 print(f"  PDF Embeddings - Total: {total_embedding_time:.2f}s, Average: {avg_embedding_time:.2f}s per page")
+        
+        print(f"\nAPI Requests:")
+        if total_parse_requests > 0:
+            print(f"  Parse requests: {total_parse_requests}")
+        if total_embedding_requests > 0:
+            print(f"  Embedding requests: {total_embedding_requests}")
+        print(f"  Total requests: {total_parse_requests + total_embedding_requests}")
         
     finally:
         ray.shutdown()
