@@ -1,3 +1,6 @@
 lancedb/
 scratch/
 extracts/
+api_key.txt
+__pycache__/
+*.pyc
