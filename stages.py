@@ -13,9 +13,12 @@ from markitdown import MarkItDown
 import lancedb
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from nemotron_table_structure_v1 import define_model, YoloXWrapper
+from transformers import AutoTokenizer, AutoModel
+import transformers
 
 
 NVAI_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -25,6 +28,73 @@ TOOLS = [
     "markdown_no_bbox",
     "detection_only",
 ]
+
+
+class PageElementsActor:
+    """Ray Data actor for page elements detection with persistent model."""
+    
+    def __call__(self, batch):
+        """Process a batch of rows through page_elements."""
+        # Convert dict-of-lists batch format to list-of-dicts
+        if isinstance(batch, dict):
+            # batch is {"col1": [val1, val2], "col2": [val1, val2]}
+            keys = list(batch.keys())
+            num_rows = len(batch[keys[0]])
+            rows = [{k: batch[k][i] for k in keys} for i in range(num_rows)]
+        else:
+            rows = batch
+        
+        results = [page_elements(row) for row in rows]
+        
+        # Convert list of dicts back to dict of lists for Ray Data
+        if results:
+            output_keys = results[0].keys()
+            return {k: [r[k] for r in results] for k in output_keys}
+        return {}
+
+
+class TableStructureActor:
+    """Ray Data actor for table structure detection with persistent model."""
+    
+    def __call__(self, batch):
+        """Process a batch of rows through process_table_structure."""
+        # Convert dict-of-lists batch format to list-of-dicts
+        if isinstance(batch, dict):
+            keys = list(batch.keys())
+            num_rows = len(batch[keys[0]])
+            rows = [{k: batch[k][i] for k in keys} for i in range(num_rows)]
+        else:
+            rows = batch
+        
+        results = [process_table_structure(row) for row in rows]
+        
+        # Convert list of dicts back to dict of lists for Ray Data
+        if results:
+            output_keys = results[0].keys()
+            return {k: [r[k] for r in results] for k in output_keys}
+        return {}
+
+
+class ChartElementsActor:
+    """Ray Data actor for chart elements detection with persistent model."""
+    
+    def __call__(self, batch):
+        """Process a batch of rows through process_chart_elements."""
+        # Convert dict-of-lists batch format to list-of-dicts
+        if isinstance(batch, dict):
+            keys = list(batch.keys())
+            num_rows = len(batch[keys[0]])
+            rows = [{k: batch[k][i] for k in keys} for i in range(num_rows)]
+        else:
+            rows = batch
+        
+        results = [process_chart_elements(row) for row in rows]
+        
+        # Convert list of dicts back to dict of lists for Ray Data
+        if results:
+            output_keys = results[0].keys()
+            return {k: [r[k] for r in results] for k in output_keys}
+        return {}
 
 
 def get_source_dir_name(source_filename):
@@ -491,8 +561,8 @@ def process_table_structure(row):
             "source_image": str(element_image_path),
             "detections": table_elements,
             "num_detections": len(table_elements),
-            "page_number": page_number,
-            "element_index": element_index
+            "page_number": int(page_number),
+            "element_index": int(element_index)
         }, f, ensure_ascii=False, indent=2)
     
     return {
@@ -604,8 +674,8 @@ def process_chart_elements(row):
             "source_image": str(element_image_path),
             "detections": chart_elements,
             "num_detections": len(chart_elements),
-            "page_number": page_number,
-            "element_index": element_index
+            "page_number": int(page_number),
+            "element_index": int(element_index)
         }, f, ensure_ascii=False, indent=2)
     
     return {
@@ -769,11 +839,11 @@ def process_ocr(row):
         ocr_metadata = {
             "source_filename": source_filename,
             "source_image": str(element_image_path),
-            "page_number": page_number,
-            "element_index": element_index,
+            "page_number": int(page_number),
+            "element_index": int(element_index),
             "element_type": label,
-            "element_bbox": element_bbox,
-            "element_score": element_score,
+            "element_bbox": element_bbox.tolist() if hasattr(element_bbox, 'tolist') else element_bbox,
+            "element_score": float(element_score) if element_score is not None else None,
             "ocr_text": ocr_text,
             "full_response": result
         }
@@ -1142,6 +1212,144 @@ class EmbeddingBatcher:
         
         except Exception as e:
             print(f"Error generating embeddings for batch: {e}")
+            # Return dataframe with None values
+            df = df.copy()
+            df["embedding_file"] = None
+            df["embedding_time"] = 0.0
+            return df
+
+
+class LocalEmbeddingBatcher:
+    """Stateful map function to batch embedding requests using local transformers model."""
+    
+    def __init__(self, batch_size=32, device="cuda:0"):
+        if transformers.__version__ != "4.47.1":
+            raise Exception("transformers version must be 4.47.1 to run this model")
+        
+        self.batch_size = batch_size
+        self.device = device
+        
+        # Load tokenizer and model
+        print(f"Loading nvidia/llama-nemotron-embed-1b-v2 model on {device}...")
+        self.tokenizer = AutoTokenizer.from_pretrained("nvidia/llama-nemotron-embed-1b-v2")
+        self.model = AutoModel.from_pretrained("nvidia/llama-nemotron-embed-1b-v2", trust_remote_code=True)
+        self.model = self.model.to(device)
+        self.model.eval()
+        
+        # Prefixes for query vs passage
+        self.document_prefix = "passage:"
+        print(f"Model loaded successfully on {device}")
+    
+    def average_pool(self, last_hidden_states, attention_mask):
+        """Average pooling with attention mask."""
+        last_hidden_states_masked = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+        embedding = last_hidden_states_masked.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+        embedding = F.normalize(embedding, dim=-1)
+        return embedding
+    
+    def __call__(self, batch):
+        """Process a batch of rows."""
+        # Convert to pandas for easier handling
+        df = pd.DataFrame(batch)
+        
+        # Get output_dir
+        if "output_dir" in df.columns:
+            output_dir = Path(df["output_dir"].iloc[0])
+        else:
+            output_dir = Path("extracts")
+        
+        # Filter rows with valid text
+        df = df[df["text"].notna() & (df["text"] != "")]
+        
+        if len(df) == 0:
+            print(f"LocalEmbeddingBatcher: Batch had no valid text rows after filtering")
+            return pd.DataFrame({
+                "embedding_file": pd.Series([], dtype=object),
+                "embedding_time": pd.Series([], dtype=float)
+            })
+        
+        print(f"LocalEmbeddingBatcher: Processing {len(df)} rows with valid text")
+        texts = df["text"].tolist()
+        
+        # Add document prefix to all texts
+        prefixed_texts = [f"{self.document_prefix} {text}" for text in texts]
+        
+        # Generate embeddings for batch
+        start_time = time.time()
+        try:
+            # Tokenize texts
+            batch_dict = self.tokenizer(
+                prefixed_texts, 
+                padding=True, 
+                truncation=True, 
+                return_tensors='pt'
+            ).to(self.device)
+            
+            # Generate embeddings
+            with torch.no_grad():
+                outputs = self.model(**batch_dict)
+            
+            # Average pooling
+            embeddings = self.average_pool(
+                outputs.last_hidden_state, 
+                batch_dict["attention_mask"]
+            )
+            
+            # Convert to list of lists for JSON serialization
+            embeddings_list = embeddings.cpu().numpy().tolist()
+            
+            embedding_time = time.time() - start_time
+            
+            # Save each embedding
+            embedding_files = []
+            embedding_times = []
+            
+            for idx, (embedding, (_, row)) in enumerate(zip(embeddings_list, df.iterrows())):
+                source_name = row.get("source_filename")
+                
+                # Use stem for directory (without extension)
+                source_dir_name = get_source_dir_name(source_name)
+                
+                # Determine output directory - all go to same embeddings folder
+                embedding_output_dir = output_dir / source_dir_name / "embeddings"
+                embedding_output_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Determine filename based on content type
+                label = row.get("label", "unknown")
+                page_num = int(row.get("page_number", 0))
+                
+                if label == "page_text":
+                    # For page text, just use page number
+                    filename = f"page_{page_num:03d}_text"
+                else:
+                    # For elements (tables/charts/infographics), include element index
+                    elem_idx = int(row.get("element_index", idx))
+                    filename = f"page_{page_num:03d}_element_{elem_idx:03d}_{label}"
+                
+                # Save embedding
+                embedding_file = embedding_output_dir / f"{filename}.json"
+                with open(embedding_file, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "embedding": embedding,
+                        "model": "nvidia/llama-nemotron-embed-1b-v2",
+                        "text": row["text"]
+                    }, f, ensure_ascii=False, indent=2)
+                
+                # Don't store embedding in dataframe, just the file path
+                embedding_files.append(str(embedding_file))
+                embedding_times.append(embedding_time / len(texts))
+            
+            # Add results to dataframe
+            df = df.copy()
+            df["embedding_file"] = embedding_files
+            df["embedding_time"] = embedding_times
+            
+            return df
+        
+        except Exception as e:
+            print(f"Error generating embeddings for batch: {e}")
+            import traceback
+            traceback.print_exc()
             # Return dataframe with None values
             df = df.copy()
             df["embedding_file"] = None

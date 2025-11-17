@@ -451,7 +451,10 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
     print(f"Found {len(pdf_files)} PDFs and {len(txt_files)} text files to process\n")
     
     # Initialize Ray
-    ray.init(ignore_reinit_error=True)
+    ray.init(
+        ignore_reinit_error=True,
+        _metrics_export_port=None,  # Disable metrics export
+    )
     
     # Start timing
     pipeline_start = time.time()
