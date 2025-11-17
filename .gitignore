@@ -3,4 +3,5 @@ scratch/
 extracts/
 api_key.txt
 __pycache__/
+inference_outputs/
 *.pyc

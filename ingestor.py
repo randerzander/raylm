@@ -240,11 +240,13 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
             all_pdf_content_ds = page_text_ds.union(ocr_ds)
             
             # Generate embeddings for all PDF content (page text + OCR results)
-            # Use fewer actors to reduce memory pressure
+            # Use local model with 1 GPU
             pdf_embedding_ds = all_pdf_content_ds.map_batches(
-                EmbeddingBatcher,
+                LocalEmbeddingBatcher,
+                fn_constructor_kwargs={"batch_size": 32, "device": "cuda:0"},
                 batch_size=32,
-                compute=ray.data.ActorPoolStrategy(size=2)
+                compute=ray.data.ActorPoolStrategy(min_size=1, max_size=1),
+                num_gpus=1
             )
             
             print(f"PDF parsing pipeline created\n")
