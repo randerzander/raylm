@@ -4,10 +4,10 @@ import sys
 from pathlib import Path
 import time
 
-# Add parent directory to path to import utils
+# Add parent directory to path to import stages
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils import chunk_text, convert_html_to_markdown, split_pdf, render_to_jpeg, parse_image
+from stages import chunk_text, convert_html_to_markdown, split_pdf, render_to_jpeg, parse_image
 
 
 def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts"):

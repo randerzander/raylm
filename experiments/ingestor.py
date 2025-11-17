@@ -1,16 +1,24 @@
 """Main Ray Data ingestion pipeline for PDFs and text files."""
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import ray
 import ray.data
-from pathlib import Path
 import time
+import numpy as np
 
 from stages import (
     split_pdf,
     render_to_jpeg,
     chunk_text,
     convert_html_to_markdown,
-    parse_image,
+    page_elements,
+    extract_page_elements,
+    process_table_structure,
+    process_chart_elements,
+    process_ocr,
     EmbeddingBatcher,
     write_to_lancedb_batch
 )
@@ -32,11 +40,10 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
     scratch_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Find all files and categorize by extension
-    all_files = sorted(data_dir.glob("*"))
-    pdf_files = [f for f in all_files if f.suffix.lower() == '.pdf' and f.is_file()]
-    html_files = [f for f in all_files if f.suffix.lower() in ['.html', '.htm'] and f.is_file()]
-    txt_files = [f for f in all_files if f.suffix.lower() == '.txt' and f.is_file()]
+    # Process only multimodal_test.pdf for quick iteration
+    pdf_files = [data_dir / "multimodal_test.pdf"]
+    html_files = []
+    txt_files = []
     
     if not pdf_files and not html_files and not txt_files:
         print(f"No PDF, HTML, or text files found in {data_dir}")
@@ -80,13 +87,14 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
             
             # Generate embeddings (use map_batches for efficient batching)
             # Use fewer actors to reduce memory pressure
-            text_embedding_ds = chunked_ds.map_batches(
-                EmbeddingBatcher,
-                batch_size=32,
-                compute=ray.data.ActorPoolStrategy(size=2)
-            )
+            # text_embedding_ds = chunked_ds.map_batches(
+            #     EmbeddingBatcher,
+            #     batch_size=32,
+            #     compute=ray.data.ActorPoolStrategy(size=2)
+            # )
+            text_embedding_ds = None
             
-            print(f"Text embedding pipeline created\n")
+            print(f"Text chunking pipeline created\n")
         
         # Process HTML files
         html_embedding_ds = None
@@ -108,13 +116,14 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
             
             # Generate embeddings (use map_batches for efficient batching)
             # Use fewer actors to reduce memory pressure
-            html_embedding_ds = html_md_ds.map_batches(
-                EmbeddingBatcher,
-                batch_size=32,
-                compute=ray.data.ActorPoolStrategy(size=2)
-            )
+            # html_embedding_ds = html_md_ds.map_batches(
+            #     EmbeddingBatcher,
+            #     batch_size=32,
+            #     compute=ray.data.ActorPoolStrategy(size=2)
+            # )
+            html_embedding_ds = None
             
-            print(f"HTML embedding pipeline created\n")
+            print(f"HTML conversion pipeline created\n")
         
         # Process PDFs
         pdf_embedding_ds = None
@@ -131,26 +140,87 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
             # Split PDFs into pages (flat_map because each PDF becomes multiple pages)
             pages_ds = pdf_ds.flat_map(split_pdf)
             
-            # Render pages to JPEG
+            # Render pages to JPEG and extract text
             pages_ds = pages_ds.map(lambda row: {**row, "output_dir": str(output_dir)})
             jpeg_ds = pages_ds.map(render_to_jpeg)
             
-            # Parse images with model
+            # Create separate branch for page text embeddings
+            # Add label "page_text" for tracking
+            page_text_ds = jpeg_ds.map(lambda row: {
+                **row,
+                "label": "page_text",
+                "output_dir": str(output_dir)
+            })
+            
+            # Parse images with local page-elements-v3 model
             jpeg_ds = jpeg_ds.map(lambda row: {**row, "output_dir": str(output_dir)})
-            parsed_ds = jpeg_ds.map(parse_image)
+            parsed_ds = jpeg_ds.map(page_elements)
             
-            # Filter out rows without markdown
-            parsed_ds = parsed_ds.filter(lambda row: row["md_file"] is not None and row["text"])
+            # Filter out rows without detections
+            parsed_ds = parsed_ds.filter(lambda row: row["num_detections"] > 0 and row["text"])
             
-            # Generate embeddings for parsed markdown
+            # Extract sub-images for each detected element
+            parsed_ds = parsed_ds.map(lambda row: {**row, "output_dir": str(output_dir)})
+            elements_ds = parsed_ds.flat_map(extract_page_elements)
+            
+            # Filter elements to only tables
+            tables_ds = elements_ds.filter(lambda row: row["label"] == "table")
+            
+            # Process table structure for table elements only
+            tables_ds = tables_ds.map(lambda row: {**row, "output_dir": str(output_dir)})
+            table_structure_ds = tables_ds.map(process_table_structure)
+            
+            # Filter elements to only charts
+            charts_ds = elements_ds.filter(lambda row: row["label"] == "chart")
+            
+            # Process chart elements for chart elements only
+            charts_ds = charts_ds.map(lambda row: {**row, "output_dir": str(output_dir)})
+            chart_elements_ds = charts_ds.map(process_chart_elements)
+            
+            # Filter elements for infographics only (directly from step 4)
+            infographics_ds = elements_ds.filter(lambda row: row["label"] in ["infographic", "graphic"])
+            infographics_ds = infographics_ds.map(lambda row: {**row, "output_dir": str(output_dir)})
+            
+            # Run OCR on all structured elements (tables with structure, charts with elements, infographics)
+            # Union the three branches together for OCR
+            print(f"Running OCR on tables, charts, and infographics...")
+            ocr_input_ds = table_structure_ds.union(chart_elements_ds).union(infographics_ds)
+            ocr_ds = ocr_input_ds.map(process_ocr)
+            
+            # Prepare OCR results for embedding
+            # For tables, use table_md if available, otherwise use ocr_text
+            # For charts and infographics, use ocr_text
+            def prepare_ocr_for_embedding(row):
+                label = row.get("label", "unknown")
+                text = ""
+                
+                if label == "table" and row.get("table_md"):
+                    # Use markdown representation for tables
+                    text = row["table_md"]
+                else:
+                    # Use OCR text for charts and infographics
+                    text = row.get("ocr_text", "")
+                
+                return {
+                    **row,
+                    "text": text,
+                    "output_dir": str(output_dir)
+                }
+            
+            ocr_ds = ocr_ds.map(prepare_ocr_for_embedding)
+            
+            # Union page text with OCR results for embedding
+            all_pdf_content_ds = page_text_ds.union(ocr_ds)
+            
+            # Generate embeddings for all PDF content (page text + OCR results)
             # Use fewer actors to reduce memory pressure
-            pdf_embedding_ds = parsed_ds.map_batches(
+            pdf_embedding_ds = all_pdf_content_ds.map_batches(
                 EmbeddingBatcher,
                 batch_size=32,
                 compute=ray.data.ActorPoolStrategy(size=2)
             )
             
-            print(f"PDF embedding pipeline created\n")
+            print(f"PDF parsing pipeline created\n")
         
         # Combine all embeddings
         print("=== Stage 4: Writing to LanceDB ===")
@@ -175,24 +245,33 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
             all_embeddings_ds = None
         
         if all_embeddings_ds:
-            # Write to LanceDB in batches
-            lancedb_results = all_embeddings_ds.map_batches(
-                lambda batch: write_to_lancedb_batch(batch, str(db_path)),
-                batch_size=100
-            )
-            
-            # Execute pipeline and collect results (this triggers lazy execution)
+            # Execute pipeline - iterate over embeddings to count types and write to LanceDB
             print("Executing pipeline...")
-            results = lancedb_results.take_all()
+            total_success = 0
+            total_failed = 0
+            content_type_counts = {}
             
-            # Results are rows from DataFrame, extract success/failed counts
-            total_success = sum(r["success"] if isinstance(r["success"], int) else r["success"][0] for r in results)
-            total_failed = sum(r["failed"] if isinstance(r["failed"], int) else r["failed"][0] for r in results)
+            # Iterate over embeddings dataset batches
+            for batch in all_embeddings_ds.iter_batches(batch_size=100):
+                # Tally content types from this batch
+                if "label" in batch:
+                    for label in batch["label"]:
+                        label_str = str(label)
+                        content_type_counts[label_str] = content_type_counts.get(label_str, 0) + 1
+                
+                # Write this batch to LanceDB
+                result_batch = write_to_lancedb_batch(batch, str(db_path))
+                batch_success = result_batch["success"][0] if isinstance(result_batch["success"][0], (int, np.integer)) else int(result_batch["success"][0])
+                batch_failed = result_batch["failed"][0] if isinstance(result_batch["failed"][0], (int, np.integer)) else int(result_batch["failed"][0])
+                total_success += batch_success
+                total_failed += batch_failed
             
-            print(f"Wrote {total_success} records to LanceDB\n")
+            print(f"Wrote {total_success} records to LanceDB")
+            print(f"Content type breakdown: {dict(sorted(content_type_counts.items()))}\n")
         else:
             total_success = 0
             total_failed = 0
+            content_type_counts = {}
             print("No embeddings to write to LanceDB\n")
         
         # Calculate end-to-end timing
@@ -203,7 +282,11 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
         # Print summary
         print("=== Summary ===")
         print(f"Files processed: {len(txt_files)} text files, {len(html_files)} HTML files, {len(pdf_files)} PDFs")
-        print(f"Total chunks (pages): {total_success}")
+        print(f"Total records embedded: {total_success}")
+        if content_type_counts:
+            print(f"  By content type:")
+            for content_type, count in sorted(content_type_counts.items()):
+                print(f"    - {content_type}: {count}")
         print(f"Extracts saved to: {output_dir}/")
         if pdf_files:
             print(f"Page PDFs saved to: {scratch_dir}/")
