@@ -2,12 +2,10 @@
 name = "raylm"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "lancedb>=0.25.3",
     "markitdown>=0.1.3",
-    "nemotron-graphic-elements-v1",
-    "nemotron-table-structure-v1>=1.0.0",
     "openai>=2.7.2",
     "pandas>=2.3.3",
     "pillow>=12.0.0",
@@ -16,8 +14,12 @@ dependencies = [
     "requests>=2.32.5",
     "rich>=14.2.0",
     "sentencepiece>=0.2.1",
+    "transformers==4.47.1",
+    "nemotron-page-elements-v3>=3.0.0",
+    "nemotron-graphic-elements-v1>=1.0.0",
+    "nemotron-table-structure-v1>=1.0.0",
+    "nemotron-ocr>=1.0.0"
 ]
 
-[tool.uv.sources]
-nemotron-table-structure-v1 = { path = "../nemotron-table-structure-v1", editable = true }
-nemotron-graphic-elements-v1 = { path = "../nemotron-graphic-elements-v1", editable = true }
+[tool.setuptools]
+package-dir = {"" = "src"}

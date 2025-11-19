@@ -330,4 +330,4 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
 
 
 if __name__ == "__main__":
-    process_files(data_dir="/raid/rgelhausen/bo20/")
+    process_files(data_dir="/localhome/local-jdyer/data")
