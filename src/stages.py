@@ -16,9 +16,12 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from nemotron_table_structure_v1 import define_model, YoloXWrapper
+from nemotron_table_structure_v1 import define_model as define_table_model
+from nemotron_page_elements_v3.model import define_model as define_page_elements_model
 from transformers import AutoTokenizer, AutoModel
 import transformers
+
+from nemotron_ocr.inference.pipeline import NemotronOCR
 
 
 NVAI_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -323,8 +326,7 @@ def convert_html_to_markdown(row):
 
 def page_elements(row):
     """Map function to parse a JPEG image using local page-elements-v3 model."""
-    from model import define_model
-    from utils import postprocess_preds_page_element
+    from nemotron_page_elements_v3.utils import postprocess_preds_page_element
     
     image_path = Path(row["jpeg_file"])
     output_dir = Path(row["output_dir"])
@@ -337,7 +339,7 @@ def page_elements(row):
     
     # Load model (this will be cached by the actor)
     if not hasattr(page_elements, "model"):
-        model = define_model("page_element_v3")
+        model = define_page_elements_model("page_element_v3")
         # Force GPU device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         page_elements.model = model.to(device).eval()
@@ -473,7 +475,8 @@ def process_table_structure(row):
     Uses nemotron-table-structure-v1 model to detect table structure
     including rows, columns, and cells.
     """
-    from nemotron_table_structure_v1 import Exp, YoloXWrapper
+    from nemotron_table_structure_v1.table_structure_v1 import Exp
+    from nemotron_table_structure_v1.model import YoloXWrapper
     from nemotron_table_structure_v1.utils import postprocess_preds_table_structure
     
     element_image_path = Path(row["element_image"])
@@ -491,35 +494,43 @@ def process_table_structure(row):
     # Create output directory for table structure results
     table_output_dir = output_dir / source_dir_name / "table_structure"
     table_output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load model (this will be cached by the actor)
+
+     # Load model (this will be cached by the actor)
     if not hasattr(process_table_structure, "model"):
-        # Initialize config
-        exp = Exp()
+        model = define_table_model("table_structure_v1")
         # Force GPU device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        exp.device = device
+        process_table_structure.model = model.to(device).eval()
+        print(f"Page elements model loaded on device: {device}")
+    
+    # # Load model (this will be cached by the actor)
+    # if not hasattr(process_table_structure, "model"):
+    #     # Initialize config
+    #     exp = Exp()
+    #     # Force GPU device
+    #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #     exp.device = device
         
-        # Update weights path to absolute path
-        weights_path = Path(__file__).parent.parent / "nemotron-table-structure-v1" / "weights.pth"
-        if weights_path.exists():
-            exp.ckpt = str(weights_path)
-        else:
-            # Try relative to nemotron package location
-            import nemotron_table_structure_v1
-            pkg_path = Path(nemotron_table_structure_v1.__file__).parent.parent
-            weights_path = pkg_path / "weights.pth"
-            if weights_path.exists():
-                exp.ckpt = str(weights_path)
+    #     # Update weights path to absolute path
+    #     weights_path = Path(__file__).parent.parent / "nemotron-table-structure-v1" / "weights.pth"
+    #     if weights_path.exists():
+    #         exp.ckpt = str(weights_path)
+    #     else:
+    #         # Try relative to nemotron package location
+    #         import nemotron_table_structure_v1
+    #         pkg_path = Path(nemotron_table_structure_v1.__file__).parent.parent
+    #         weights_path = pkg_path / "weights.pth"
+    #         if weights_path.exists():
+    #             exp.ckpt = str(weights_path)
         
-        # Create model
-        model = exp.get_model()
-        ckpt = torch.load(exp.ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"], strict=True)
+    #     # Create model
+    #     model = exp.get_model()
+    #     ckpt = torch.load(exp.ckpt, map_location=device, weights_only=False)
+    #     model.load_state_dict(ckpt["model"], strict=True)
         
-        model = YoloXWrapper(model, exp)
-        process_table_structure.model = model.eval().to(device)
-        print(f"Table structure model loaded on device: {device}")
+    #     model = YoloXWrapper(model, exp)
+    #     process_table_structure.model = model.eval().to(device)
+    #     print(f"Table structure model loaded on device: {device}")
     
     model = process_table_structure.model
     
@@ -586,7 +597,8 @@ def process_chart_elements(row):
     Uses nemotron-graphic-elements-v1 model to detect chart elements
     including titles, axis labels, legends, and data annotations.
     """
-    from nemotron_graphic_elements_v1 import Exp, YoloXWrapper
+    from nemotron_graphic_elements_v1.graphic_element_v1 import Exp
+    from nemotron_graphic_elements_v1.model import YoloXWrapper
     from nemotron_graphic_elements_v1.utils import postprocess_preds_graphic_element
     
     element_image_path = Path(row["element_image"])
@@ -791,41 +803,38 @@ def process_ocr(row):
     ocr_output_dir = output_dir / source_dir_name / "ocr"
     ocr_output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Read and encode image as base64
-    with open(element_image_path, "rb") as f:
-        image_b64 = base64.b64encode(f.read()).decode()
+    # # Read and encode image as base64
+    # with open(element_image_path, "rb") as f:
+    #     image_b64 = base64.b64encode(f.read()).decode()
     
-    # Prepare request
-    invoke_url = "http://localhost:8009/v1/infer"
-    headers = {
-        "Accept": "application/json"
-    }
-    payload = {
-        "input": [
-            {
-                "type": "image_url",
-                "url": f"data:image/jpeg;base64,{image_b64}"
-            }
-        ]
-    }
+    # # Prepare request
+    # invoke_url = "http://localhost:8009/v1/infer"
+    # headers = {
+    #     "Accept": "application/json"
+    # }
+    # payload = {
+    #     "input": [
+    #         {
+    #             "type": "image_url",
+    #             "url": f"data:image/jpeg;base64,{image_b64}"
+    #         }
+    #     ]
+    # }
     
     # Call OCR service
     start_time = time.time()
     try:
-        response = requests.post(invoke_url, headers=headers, json=payload, timeout=120)
-        response.raise_for_status()
-        result = response.json()
-        model_time = time.time() - start_time
+        # response = requests.post(invoke_url, headers=headers, json=payload, timeout=120)
+        # response.raise_for_status()
+        # result = response.json()
+
+        ocr = NemotronOCR()
         
-        # Extract OCR text from response
-        # Response format: {"data": [{"index": 0, "text_detections": [...]}]}
-        ocr_text = ""
-        text_detections = []
-        if "data" in result and len(result["data"]) > 0:
-            text_detections = result["data"][0].get("text_detections", [])
-            # Extract text from each detection and combine
-            texts = [detection["text_prediction"]["text"] for detection in text_detections]
-            ocr_text = " ".join(texts)
+        predictions = ocr(element_image_path)
+
+        model_time = time.time() - start_time
+
+        ocr_text = " ".join([prediction["text"] for prediction in predictions])
         
         # Generate table markdown if this is a table with structure
         table_md = None
