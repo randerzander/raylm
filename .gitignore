@@ -5,3 +5,8 @@ api_key.txt
 __pycache__/
 inference_outputs/
 *.pyc
+
+build
+
+# These wheels must be built manually and are not included in the repository
+nemotron-wheels/

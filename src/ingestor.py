@@ -24,7 +24,8 @@ from stages import (
     write_to_lancedb_batch,
     PageElementsActor,
     TableStructureActor,
-    ChartElementsActor
+    ChartElementsActor,
+    OCRActor
 )
 
 
@@ -212,7 +213,12 @@ def process_files(data_dir="data", scratch_dir="scratch", output_dir="extracts",
             # Union the three branches together for OCR
             print(f"Running OCR on tables, charts, and infographics...")
             ocr_input_ds = table_structure_ds.union(chart_elements_ds).union(infographics_ds)
-            ocr_ds = ocr_input_ds.map(process_ocr)
+            ocr_ds = ocr_input_ds.map_batches(
+                OCRActor,
+                batch_size=32,
+                compute=ray.data.ActorPoolStrategy(min_size=1, max_size=1),
+                num_gpus=1
+            )
             
             # Prepare OCR results for embedding
             # For tables, use table_md if available, otherwise use ocr_text
