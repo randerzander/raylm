@@ -100,6 +100,28 @@ class ChartElementsActor:
         return {}
 
 
+class OCRActor:
+    """Ray Data actor for OCR with persistent model."""
+    
+    def __call__(self, batch):
+        """Process a batch of rows through process_ocr."""
+        # Convert dict-of-lists batch format to list-of-dicts
+        if isinstance(batch, dict):
+            keys = list(batch.keys())
+            num_rows = len(batch[keys[0]])
+            rows = [{k: batch[k][i] for k in keys} for i in range(num_rows)]
+        else:
+            rows = batch
+        
+        results = [process_ocr(row) for row in rows]
+        
+        # Convert list of dicts back to dict of lists for Ray Data
+        if results:
+            output_keys = results[0].keys()
+            return {k: [r[k] for r in results] for k in output_keys}
+        return {}
+
+
 def get_source_dir_name(source_filename):
     """Get directory name from source filename (strips extension if present)."""
     return Path(source_filename).stem
@@ -821,16 +843,20 @@ def process_ocr(row):
     #     ]
     # }
     
+    # Initialize OCR model (cached per actor)
+    if not hasattr(process_ocr, "ocr_model"):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        process_ocr.ocr_model = NemotronOCR()
+        print(f"OCR model loaded on device: {device}")
+    
     # Call OCR service
     start_time = time.time()
     try:
         # response = requests.post(invoke_url, headers=headers, json=payload, timeout=120)
         # response.raise_for_status()
         # result = response.json()
-
-        ocr = NemotronOCR()
         
-        predictions = ocr(element_image_path)
+        predictions = process_ocr.ocr_model(element_image_path)
 
         model_time = time.time() - start_time
 
@@ -838,8 +864,8 @@ def process_ocr(row):
         
         # Generate table markdown if this is a table with structure
         table_md = None
-        if label == "table" and table_elements is not None and text_detections:
-            table_md = generate_table_markdown(table_elements, text_detections)
+        if label == "table" and table_elements is not None and predictions:
+            table_md = generate_table_markdown(table_elements, predictions)
         
         # Save OCR result as JSON with metadata
         json_filename = f"page_{page_number:03d}_element_{element_index:03d}_{label}_ocr.json"
@@ -854,7 +880,7 @@ def process_ocr(row):
             "element_bbox": element_bbox.tolist() if hasattr(element_bbox, 'tolist') else element_bbox,
             "element_score": float(element_score) if element_score is not None else None,
             "ocr_text": ocr_text,
-            "full_response": result
+            "full_response": predictions
         }
         
         # Add table markdown if generated

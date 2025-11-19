@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+docs/
+
+# Data and outputs
+data/
+extracts/
+scratch/
+*.pdf
+*.jpg
+*.jpeg
+*.png
+
+# IMPORTANT: Don't ignore nemotron-wheels (needed for build)
+!nemotron-wheels/
+!nemotron-wheels/*.whl
+
+# Database
+*.db
+lancedb/
+*.lance
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Environment
+.env
+.env.local
+
+# Jupyter
+*.ipynb
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+experiments/
+tests/
+

@@ -39,18 +39,75 @@ All stages run in parallel using Ray Data streaming pipeline.
 - Python 3.8+
 - NVIDIA API key
 
+## ⚠️ Important: Nemotron Wheels Setup
+
+**Before building the Docker image or installing the project**, you must create a `nemotron-wheels/` directory in the project root containing the following private wheel files:
+
+```
+nemotron-wheels/
+├── nemotron_page_elements_v3-3.0.0-py3-none-any.whl
+├── nemotron_graphic_elements_v1-1.0.0-py3-none-any.whl
+├── nemotron_table_structure_v1-1.0.0-py3-none-any.whl
+└── nemotron_ocr-1.0.0-py3-none-any.whl
+```
+
+### Required Wheels:
+
+1. **nemotron-page-elements-v3** (>= 3.0.0) - Page element detection model
+2. **nemotron-graphic-elements-v1** (>= 1.0.0) - Graphic element detection model  
+3. **nemotron-table-structure-v1** (>= 1.0.0) - Table structure detection model
+4. **nemotron-ocr** (>= 1.0.0) - OCR model
+
+**Note:** These wheels are not publicly available and must be obtained separately. The Docker build will fail if this directory is missing or incomplete.
+
+### Verification:
+
+```bash
+# Verify all required wheels are present
+ls nemotron-wheels/*.whl
+
+# Should show 4 .whl files
+```
+
+Once these wheels become publicly available, this requirement will be removed.
+
 ## Installation
+
+### Option 1: Docker (Recommended for Production)
+
+```bash
+# Build the Docker image (ensure nemotron-wheels/ is present first)
+docker build -t raylm-api:latest .
+
+# Run the container
+docker run -d --name raylm-api -p 8000:8000 raylm-api:latest
+
+# Or use docker-compose
+docker-compose up -d
+```
+
+See [QUICKSTART.md](QUICKSTART.md) and [DOCKER_USAGE.md](DOCKER_USAGE.md) for more details.
+
+### Option 2: Local Installation
 
 Using uv (recommended):
 
 ```bash
+# Install nemotron wheels first
+pip install nemotron-wheels/*.whl
+
+# Install project
 uv sync
 ```
 
 Or manually:
 
 ```bash
-pip install ray pandas rich pypdfium2 requests openai lancedb pillow markitdown
+# Install nemotron wheels first
+pip install nemotron-wheels/*.whl
+
+# Install other dependencies
+pip install ray pandas rich pypdfium2 requests openai lancedb pillow markitdown fastapi uvicorn
 ```
 
 ## Setup
@@ -61,7 +118,37 @@ export NVIDIA_API_KEY="your_api_key_here"
 
 ## Usage
 
-### Process Files
+### FastAPI Server
+
+Start the document ingestion API server:
+
+```bash
+# Direct execution
+python src/api.py
+
+# Or with custom options
+python src/api.py --host 0.0.0.0 --port 8000 --log-level info
+
+# Or using the installed script
+raylm-api --port 8000
+```
+
+Submit documents via HTTP:
+
+```bash
+# Submit a document
+curl -X POST http://localhost:8000/submit \
+  -F "file=@document.pdf"
+
+# Check health
+curl http://localhost:8000/health
+```
+
+Interactive API docs available at: http://localhost:8000/docs
+
+See [API_USAGE.md](API_USAGE.md) for complete API documentation.
+
+### Process Files (Batch Pipeline)
 
 Place PDFs, HTML, and/or text files in `data/` directory. Files are automatically processed based on extension:
 
